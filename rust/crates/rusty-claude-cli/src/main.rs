@@ -251,6 +251,24 @@ struct ResumeCommandOutcome {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct StatusContext {
+    cwd: PathBuf,
+    session_path: Option<PathBuf>,
+    loaded_config_files: usize,
+    discovered_config_files: usize,
+    memory_file_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatusUsage {
+    message_count: usize,
+    turns: u32,
+    latest: TokenUsage,
+    cumulative: TokenUsage,
+    estimated_tokens: usize,
+}
+
 fn run_resume_command(
     session_path: &Path,
     session: &Session,
@@ -297,14 +315,17 @@ fn run_resume_command(
             let usage = tracker.cumulative_usage();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format_status_line(
+                message: Some(format_status_report(
                     "restored-session",
-                    session.messages.len(),
-                    tracker.turns(),
-                    tracker.current_turn_usage(),
-                    usage,
-                    0,
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
                     permission_mode_label(),
+                    &status_context(Some(session_path))?,
                 )),
             })
         }
@@ -443,14 +464,17 @@ impl LiveCli {
         let latest = self.runtime.usage().current_turn_usage();
         println!(
             "{}",
-            format_status_line(
+            format_status_report(
                 &self.model,
-                self.runtime.session().messages.len(),
-                self.runtime.usage().turns(),
-                latest,
-                cumulative,
-                self.runtime.estimated_tokens(),
+                StatusUsage {
+                    message_count: self.runtime.session().messages.len(),
+                    turns: self.runtime.usage().turns(),
+                    latest,
+                    cumulative,
+                    estimated_tokens: self.runtime.estimated_tokens(),
+                },
                 permission_mode_label(),
+                &status_context(None).expect("status context should load"),
             )
         );
     }
@@ -586,21 +610,58 @@ fn render_repl_help() -> String {
     )
 }
 
-fn format_status_line(
+fn status_context(
+    session_path: Option<&Path>,
+) -> Result<StatusContext, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered_config_files = loader.discover().len();
+    let runtime_config = loader.load()?;
+    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    Ok(StatusContext {
+        cwd,
+        session_path: session_path.map(Path::to_path_buf),
+        loaded_config_files: runtime_config.loaded_entries().len(),
+        discovered_config_files,
+        memory_file_count: project_context.instruction_files.len(),
+    })
+}
+
+fn format_status_report(
     model: &str,
-    message_count: usize,
-    turns: u32,
-    latest: TokenUsage,
-    cumulative: TokenUsage,
-    estimated_tokens: usize,
+    usage: StatusUsage,
     permission_mode: &str,
+    context: &StatusContext,
 ) -> String {
-    format!(
-        "status: model={model} permission_mode={permission_mode} messages={message_count} turns={turns} estimated_tokens={estimated_tokens} latest_tokens={} cumulative_input_tokens={} cumulative_output_tokens={} cumulative_total_tokens={}",
-        latest.total_tokens(),
-        cumulative.input_tokens,
-        cumulative.output_tokens,
-        cumulative.total_tokens(),
+    let mut lines = vec![format!(
+        "status: model={model} permission_mode={permission_mode} messages={} turns={} estimated_tokens={} latest_tokens={} cumulative_input_tokens={} cumulative_output_tokens={} cumulative_total_tokens={}",
+        usage.message_count,
+        usage.turns,
+        usage.estimated_tokens,
+        usage.latest.total_tokens(),
+        usage.cumulative.input_tokens,
+        usage.cumulative.output_tokens,
+        usage.cumulative.total_tokens(),
+    )];
+    lines.push(format!("  cwd            {}", context.cwd.display()));
+    lines.push(format!(
+        "  session        {}",
+        context.session_path.as_ref().map_or_else(
+            || "live-repl".to_string(),
+            |path| path.display().to_string()
+        )
+    ));
+    lines.push(format!(
+        "  config         loaded {}/{} files",
+        context.loaded_config_files, context.discovered_config_files
+    ));
+    lines.push(format!(
+        "  memory         {} instruction files",
+        context.memory_file_count
+    ));
+    lines.join(
+        "
+",
     )
 }
 
@@ -1097,8 +1158,9 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_status_line, normalize_permission_mode, parse_args, render_init_claude_md,
-        render_repl_help, resume_supported_slash_commands, CliAction, SlashCommand, DEFAULT_MODEL,
+        format_status_report, normalize_permission_mode, parse_args, render_init_claude_md,
+        render_repl_help, resume_supported_slash_commands, status_context, CliAction, SlashCommand,
+        StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
     use std::path::{Path, PathBuf};
@@ -1215,30 +1277,51 @@ mod tests {
 
     #[test]
     fn status_line_reports_model_and_token_totals() {
-        let status = format_status_line(
+        let status = format_status_report(
             "claude-sonnet",
-            7,
-            3,
-            runtime::TokenUsage {
-                input_tokens: 5,
-                output_tokens: 4,
-                cache_creation_input_tokens: 1,
-                cache_read_input_tokens: 0,
+            StatusUsage {
+                message_count: 7,
+                turns: 3,
+                latest: runtime::TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 4,
+                    cache_creation_input_tokens: 1,
+                    cache_read_input_tokens: 0,
+                },
+                cumulative: runtime::TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 8,
+                    cache_creation_input_tokens: 2,
+                    cache_read_input_tokens: 1,
+                },
+                estimated_tokens: 128,
             },
-            runtime::TokenUsage {
-                input_tokens: 20,
-                output_tokens: 8,
-                cache_creation_input_tokens: 2,
-                cache_read_input_tokens: 1,
-            },
-            128,
             "workspace-write",
+            &super::StatusContext {
+                cwd: PathBuf::from("/tmp/project"),
+                session_path: Some(PathBuf::from("session.json")),
+                loaded_config_files: 2,
+                discovered_config_files: 3,
+                memory_file_count: 4,
+            },
         );
         assert!(status.contains("model=claude-sonnet"));
         assert!(status.contains("permission_mode=workspace-write"));
         assert!(status.contains("messages=7"));
         assert!(status.contains("latest_tokens=10"));
         assert!(status.contains("cumulative_total_tokens=31"));
+        assert!(status.contains("cwd            /tmp/project"));
+        assert!(status.contains("session        session.json"));
+        assert!(status.contains("config         loaded 2/3 files"));
+        assert!(status.contains("memory         4 instruction files"));
+    }
+
+    #[test]
+    fn status_context_reads_real_workspace_metadata() {
+        let context = status_context(None).expect("status context should load");
+        assert!(context.cwd.is_absolute());
+        assert_eq!(context.discovered_config_files, 3);
+        assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 
     #[test]
